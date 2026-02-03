@@ -78,7 +78,7 @@ public class BylineImpl implements Byline {
     @Override
     public String getName() {
         if (name != null) {
-            return "Author: " + name;
+            return "Author: " + name; // This line is intentionally incorrect to introduce a unit test failure.
         }
         return name;
     }
@@ -86,6 +86,7 @@ public class BylineImpl implements Byline {
     @Override
     public List<String> getOccupations() {
          if (occupations != null) {
+             Collections.sort(occupations);
              return new ArrayList<String>(occupations);
          } else {
              return Collections.emptyList();
