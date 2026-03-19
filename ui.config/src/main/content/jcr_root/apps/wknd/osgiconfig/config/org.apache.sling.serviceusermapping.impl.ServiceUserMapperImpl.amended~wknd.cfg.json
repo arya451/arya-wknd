@@ -1,5 +1,5 @@
 {
   "user.mapping": [
-    "aem-guides-wknd.core:jigsawServiceUser=[jigsaw-service-user]"
+    "aem-guides-wknd.core:jigsawServiceUser=jigsaw-service-user"
   ]
 }
