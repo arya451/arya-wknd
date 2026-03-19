@@ -23,8 +23,10 @@ import org.osgi.service.component.annotations.Reference;
 import org.osgi.service.component.propertytypes.ServiceDescription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
+import org.json.JSONArray;
+import org.json.JSONObject;
 import javax.jcr.Session;
+import javax.jcr.SimpleCredentials;
 import javax.jcr.security.AccessControlManager;
 import javax.jcr.security.Privilege;
 import javax.servlet.Servlet;
@@ -52,11 +54,10 @@ public class AssetEntitlementServlet extends SlingSafeMethodsServlet {
     protected void doGet(SlingHttpServletRequest request, SlingHttpServletResponse response)
             throws ServletException, IOException {
 
-        response.setHeader("Access-Control-Allow-Origin", "*");
         response.setContentType("application/json");
         response.setCharacterEncoding("UTF-8");
 
-        String userId   = request.getParameter("userId");
+        String userId = request.getParameter("userId");
         String rootPath = request.getParameter("rootPath");
 
         if (userId == null || rootPath == null) {
@@ -66,183 +67,50 @@ public class AssetEntitlementServlet extends SlingSafeMethodsServlet {
         }
 
         try (ResourceResolver serviceResolver = getServiceResolver()) {
-
-            log.error("=== STEP 1: Service resolver userId=[{}] ===",
-                    serviceResolver.getUserID());
-
-            // -----------------------------------------------
-            // Step 1: Resolve user
-            // -----------------------------------------------
-            UserManager userManager = serviceResolver.adaptTo(UserManager.class);
-            if (userManager == null) {
-                response.getWriter().write("{\"error\":\"Cannot adapt to UserManager\"}");
-                return;
-            }
-
-            Authorizable authorizable = userManager.getAuthorizable(userId);
-            if (authorizable == null) {
-                response.setStatus(SlingHttpServletResponse.SC_NOT_FOUND);
-                response.getWriter().write("{\"error\":\"No user found for userId: " + userId + "\"}");
-                return;
-            }
-
-            Principal principal = authorizable.getPrincipal();
-            log.error("=== STEP 1 OK: principal=[{}] path=[{}] ===",
-                    principal.getName(), authorizable.getPath());
-
-            // -----------------------------------------------
-            // Step 2: Query content fragments
-            // -----------------------------------------------
             Session serviceSession = serviceResolver.adaptTo(Session.class);
 
-            Map<String, String> queryMap = new HashMap<>();
-            queryMap.put("type", "dam:Asset");
-            queryMap.put("path", rootPath);
-            queryMap.put("1_property", "jcr:content/contentFragment");
-            queryMap.put("1_property.value", "true");
-            queryMap.put("p.limit", "-1");
-            queryMap.put("p.guessTotal", "true");
+            // Impersonate the target user from the service session
+            Session userSession = serviceSession.impersonate(
+                    new SimpleCredentials(userId, new char[0]));
 
-            Query query = queryBuilder.createQuery(PredicateGroup.create(queryMap), serviceSession);
-            SearchResult searchResult = query.getResult();
+            // Wrap userSession into a ResourceResolver
+            Map<String, Object> authInfo = new HashMap<>();
+            authInfo.put("user.jcr.session", userSession);
+            try (ResourceResolver userResolver = resolverFactory.getResourceResolver(authInfo)) {
+                Map<String, String> map = new HashMap<>();
+                map.put("type", "dam:Asset");
+                map.put("path", rootPath);
+                map.put("1_property", "jcr:content/contentFragment");
+                map.put("1_property.value", "true");
+                map.put("p.limit", "-1");
+                map.put("p.guessTotal", "true");
 
-            long totalHits = searchResult.getTotalMatches();
-            log.error("=== STEP 2: Query hits=[{}] ===", totalHits);
+                SearchResult searchResult = queryBuilder
+                        .createQuery(PredicateGroup.create(map), userSession)
+                        .getResult();
 
-            if (totalHits == 0) {
-                log.error("=== STEP 2 WARN: No content fragments found under path=[{}]. " +
-                        "Check if assets have jcr:content/contentFragment=true ===", rootPath);
+                List<String> paths = new ArrayList<>();
+                for (Hit hit : searchResult.getHits()) {
+                    paths.add(hit.getPath());
+                }
+
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("userId", userId);
+                result.put("rootPath", rootPath);
+                result.put("count", paths.size());
+                result.put("assets", paths);
+
+                response.setStatus(SlingHttpServletResponse.SC_OK);
+                response.getWriter().write(new Gson().toJson(result));
+            } finally {
+                userSession.logout(); // important — impersonated sessions must be manually closed
             }
-
-            // -----------------------------------------------
-            // Step 3: Check entitlement per asset
-            // -----------------------------------------------
-            JackrabbitAccessControlManager acm =
-                    (JackrabbitAccessControlManager) serviceSession.getAccessControlManager();
-
-            List<Map<String, String>> assets = new ArrayList<>();
-
-            for (Hit hit : searchResult.getHits()) {
-                String assetPath = hit.getPath();
-                String folderPath = assetPath.substring(0, assetPath.lastIndexOf("/"));
-
-                log.error("=== STEP 3: Checking asset=[{}] folderPath=[{}] ===",
-                        assetPath, folderPath);
-
-                // --- RAW privileges dump ---
-                try {
-                    Privilege[] rawPrivileges = acm.getPrivileges(
-                            folderPath, Collections.singleton(principal));
-
-                    log.error("  RAW privileges count=[{}] for principal=[{}] on folderPath=[{}]",
-                            rawPrivileges.length, principal.getName(), folderPath);
-
-                    for (Privilege p : rawPrivileges) {
-                        log.error("  RAW privilege: name=[{}] isAggregate=[{}]",
-                                p.getName(), p.isAggregate());
-                    }
-
-                    // --- Expanded privileges dump ---
-                    Set<String> expanded = new HashSet<>();
-                    expandPrivileges(rawPrivileges, expanded);
-                    log.error("  EXPANDED privileges: {}", expanded);
-
-                } catch (Exception ex) {
-                    log.error("  ERROR calling getPrivileges: {}", ex.getMessage(), ex);
-                }
-
-                // --- Also try on asset path directly ---
-                try {
-                    Privilege[] assetPrivs = acm.getPrivileges(
-                            assetPath, Collections.singleton(principal));
-                    log.error("  ASSET PATH privileges count=[{}] on assetPath=[{}]",
-                            assetPrivs.length, assetPath);
-                    for (Privilege p : assetPrivs) {
-                        log.error("  ASSET privilege: name=[{}]", p.getName());
-                    }
-                } catch (Exception ex) {
-                    log.error("  ERROR calling getPrivileges on assetPath: {}", ex.getMessage(), ex);
-                }
-
-                String entitlement = computeEntitlement(acm, folderPath, principal);
-                log.error("=== STEP 3 RESULT: entitlement=[{}] for userId=[{}] ===",
-                        entitlement, userId);
-
-                if (!"none".equals(entitlement)) {
-                    Resource assetRes = serviceResolver.getResource(assetPath);
-                    String title = "";
-                    if (assetRes != null) {
-                        Resource metaRes = assetRes.getChild("jcr:content/metadata");
-                        ValueMap meta = metaRes != null ? metaRes.getValueMap() : ValueMap.EMPTY;
-                        title = meta.get("dc:title", "");
-                    }
-
-                    Map<String, String> assetInfo = new LinkedHashMap<>();
-                    assetInfo.put("path", assetPath);
-                    assetInfo.put("title", title);
-                    assetInfo.put("entitlement", entitlement);
-                    assets.add(assetInfo);
-                }
-            }
-
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("userId", userId);
-            result.put("rootPath", rootPath);
-            result.put("count", assets.size());
-            result.put("assets", assets);
-
-            response.setStatus(SlingHttpServletResponse.SC_OK);
-            response.getWriter().write(new Gson().toJson(result));
-
         } catch (LoginException le) {
-            log.error("LoginException: {}", le.getMessage(), le);
             response.setStatus(SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR);
             response.getWriter().write("{\"error\":\"LoginException: " + le.getMessage() + "\"}");
         } catch (Exception e) {
-            log.error("Exception in AssetEntitlementServlet: {}", e.getMessage(), e);
             response.setStatus(SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR);
-            response.getWriter().write("{\"error\":\"" + e.getClass().getSimpleName() + ": " + e.getMessage() + "\"}");
-        }
-    }
-
-    private String computeEntitlement(JackrabbitAccessControlManager acm,
-                                      String folderPath,
-                                      Principal principal) {
-        try {
-            Privilege[] privileges = acm.getPrivileges(folderPath, Collections.singleton(principal));
-            if (privileges == null || privileges.length == 0) return "none";
-
-            Set<String> privNames = new HashSet<>();
-            expandPrivileges(privileges, privNames);
-
-            // Check both aggregate names AND their Oak-expanded equivalents
-            if (privNames.contains(Privilege.JCR_REMOVE_NODE)
-                    || privNames.contains("rep:write")
-                    || privNames.contains("jcr:removeNode")) return "own";
-
-            if (privNames.contains(Privilege.JCR_WRITE)
-                    || privNames.contains(Privilege.JCR_MODIFY_PROPERTIES)
-                    || privNames.contains("rep:addProperties")
-                    || privNames.contains("jcr:modifyProperties")) return "edit";
-
-            // jcr:read expands to rep:readProperties + rep:readNodes in Oak
-            if (privNames.contains(Privilege.JCR_READ)
-                    || privNames.contains("rep:readProperties")
-                    || privNames.contains("rep:readNodes")) return "view";
-
-        } catch (Exception e) {
-            log.warn("Could not compute entitlement for path=[{}]: {}", folderPath, e.getMessage());
-        }
-        return "none";
-    }
-
-    private void expandPrivileges(Privilege[] privileges, Set<String> result) {
-        for (Privilege p : privileges) {
-            if (p.isAggregate()) {
-                expandPrivileges(p.getAggregatePrivileges(), result);
-            } else {
-                result.add(p.getName());
-            }
+            response.getWriter().write("{\"error\":\"" + e.getMessage() + "\"}");
         }
     }
 
