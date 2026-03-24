@@ -1,9 +1,7 @@
 {
   "scripts": [
     "create service user jigsaw-service-user with path system/cq:services/jigsaw",
-    "set ACL for jigsaw-service-user\nallow jcr:read on /home\nend",
-    "set ACL for jigsaw-service-user\nallow jcr:read,jcr:readAccessControl on /content\nend",
-    "set ACL for jigsaw-service-user\nallow jcr:read,jcr:write on /var\nend",
-    "set ACL for jigsaw-service-user\nallow jcr:all on /home/users\nend"
+    "set ACL for jigsaw-service-user\nallow jcr:read on /home\nallow jcr:read,jcr:readAccessControl on /content\nallow jcr:read,jcr:write on /var\nallow jcr:all on /home/users\nend",
+    "set principal ACL for jigsaw-service-user\nallow jcr:impersonate on /home/users/l/lQUyusXILWQQxvylljgR\nend"
   ]
 }

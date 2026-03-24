@@ -23,8 +23,8 @@ import org.osgi.service.component.annotations.Reference;
 import org.osgi.service.component.propertytypes.ServiceDescription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.json.JSONArray;
-import org.json.JSONObject;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import javax.jcr.Session;
 import javax.jcr.SimpleCredentials;
 import javax.jcr.security.AccessControlManager;
@@ -34,6 +34,7 @@ import javax.servlet.ServletException;
 import java.io.IOException;
 import java.security.Principal;
 import java.util.*;
+import org.apache.jackrabbit.api.JackrabbitSession;
 
 @Component(service = Servlet.class)
 @SlingServletPaths("/bin/asset-entitlements")
@@ -49,6 +50,21 @@ public class AssetEntitlementServlet extends SlingSafeMethodsServlet {
 
     @Reference
     private QueryBuilder queryBuilder;
+
+private String findUserIdByEmail(UserManager userManager, String email) throws Exception {
+    // Search for users with matching email in profile/email property
+    Iterator<Authorizable> it = userManager.findAuthorizables(
+        "profile/email", 
+        email, 
+        UserManager.SEARCH_TYPE_USER  // Add this to search only users, not groups
+    );
+    
+    if (it.hasNext()) {
+        Authorizable auth = it.next();
+        return auth.getID();
+    }
+    return null;
+}
 
     @Override
     protected void doGet(SlingHttpServletRequest request, SlingHttpServletResponse response)
@@ -67,16 +83,43 @@ public class AssetEntitlementServlet extends SlingSafeMethodsServlet {
         }
 
         try (ResourceResolver serviceResolver = getServiceResolver()) {
-            Session serviceSession = serviceResolver.adaptTo(Session.class);
 
-            // Impersonate the target user from the service session
-            Session userSession = serviceSession.impersonate(
-                    new SimpleCredentials(userId, new char[0]));
+            Session adminSession = serviceResolver.adaptTo(Session.class);
+            if (adminSession == null) {
+                response.setStatus(SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+                response.getWriter().write("{\"error\":\"Cannot adapt to JCR Session\"}");
+                return;
+            }
 
-            // Wrap userSession into a ResourceResolver
-            Map<String, Object> authInfo = new HashMap<>();
-            authInfo.put("user.jcr.session", userSession);
-            try (ResourceResolver userResolver = resolverFactory.getResourceResolver(authInfo)) {
+            // Cast to JackrabbitSession to access getUserManager()
+            if (!(adminSession instanceof JackrabbitSession)) {
+                response.setStatus(SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+                response.getWriter().write("{\"error\":\"Session is not a JackrabbitSession\"}");
+                return;
+            }
+
+            JackrabbitSession jackrabbitSession = (JackrabbitSession) adminSession;
+            UserManager userManager = jackrabbitSession.getUserManager();
+
+            String id = findUserIdByEmail(userManager, userId);
+            if (id == null) {
+                response.setStatus(SlingHttpServletResponse.SC_NOT_FOUND);
+                response.getWriter().write("{\"error\":\"No user found for email\"}");
+                return;
+            }
+
+            Map<String, Object> userAuthInfo = new HashMap<>();
+            userAuthInfo.put(ResourceResolverFactory.USER, userId);
+
+            try (ResourceResolver userResolver = resolverFactory.getResourceResolver(userAuthInfo)) {
+                Session userSession = userResolver.adaptTo(Session.class);
+
+                if (userSession == null || !userSession.isLive()) {
+                    response.setStatus(SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+                    response.getWriter().write("{\"error\":\"Cannot obtain user session\"}");
+                    return;
+                }
+
                 Map<String, String> map = new HashMap<>();
                 map.put("type", "dam:Asset");
                 map.put("path", rootPath);
@@ -90,6 +133,8 @@ public class AssetEntitlementServlet extends SlingSafeMethodsServlet {
                         .getResult();
 
                 List<String> paths = new ArrayList<>();
+
+                // JsonArray assetsArray = new JsonArray();
                 for (Hit hit : searchResult.getHits()) {
                     paths.add(hit.getPath());
                 }
@@ -102,10 +147,9 @@ public class AssetEntitlementServlet extends SlingSafeMethodsServlet {
 
                 response.setStatus(SlingHttpServletResponse.SC_OK);
                 response.getWriter().write(new Gson().toJson(result));
-            } finally {
-                userSession.logout(); // important — impersonated sessions must be manually closed
             }
         } catch (LoginException le) {
+            log.error("LoginException while obtaining service resolver: {}", le.getMessage(), le);
             response.setStatus(SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR);
             response.getWriter().write("{\"error\":\"LoginException: " + le.getMessage() + "\"}");
         } catch (Exception e) {
