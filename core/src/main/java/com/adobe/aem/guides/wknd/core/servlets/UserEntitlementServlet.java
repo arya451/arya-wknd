@@ -8,9 +8,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
 import org.apache.jackrabbit.api.JackrabbitSession;
-import org.apache.jackrabbit.api.security.JackrabbitAccessControlManager;
 import org.apache.jackrabbit.api.security.user.Authorizable;
-import org.apache.jackrabbit.api.security.user.Group;
 import org.apache.jackrabbit.api.security.user.UserManager;
 import org.apache.sling.api.SlingHttpServletRequest;
 import org.apache.sling.api.SlingHttpServletResponse;
@@ -29,30 +27,26 @@ import org.slf4j.LoggerFactory;
 
 import javax.jcr.RepositoryException;
 import javax.jcr.Session;
-import javax.jcr.security.Privilege;
 import javax.servlet.Servlet;
-import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.security.Principal;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Calendar;
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.TimeZone;
+import java.util.regex.Pattern;
+import com.google.gson.stream.JsonWriter;
 
 /**
  * Servlet that returns content fragments accessible by a specific user.
- * Checks ACL permissions and returns full asset metadata in JSON format.
- * 
- * Usage:
- * /bin/jigsaw/user-entitlement?email=xxx@example.com&rootPath=/content/dam/xxx
+ * Uses impersonation so the query itself is ACL-filtered — only assets
+ * the target user can read are returned.
+ * Usage: /bin/jigsaw/user-entitlement?email=xxx@example.com
  */
 @Component(service = Servlet.class)
 @SlingServletPaths("/bin/jigsaw/user-entitlement")
@@ -61,84 +55,186 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
 
     private static final Logger log = LoggerFactory.getLogger(UserEntitlementServlet.class);
     private static final long serialVersionUID = 1L;
+
+    /** Service username mapped in the Sling Service User Mapper configuration. */
     private static final String SUBSERVICE = "jigsawServiceUser";
 
+    /** Query parameter name used to pass the user's email address. */
     private static final String PARAM_EMAIL = "email";
-    private static final String PARAM_ROOT_PATH = "path";
+
+    /** Date format pattern used when serializing {@link Calendar} values to JSON. */
     private static final String DATE_FORMAT = "EEE MMM dd yyyy HH:mm:ss 'GMT'Z";
 
-    @Reference
-    private ResourceResolverFactory resolverFactory;
+    /** Compact Gson instance for error responses — Gson is thread-safe and reusable. */
+    private static final Gson GSON = new Gson();
 
-    @Reference
-    private QueryBuilder queryBuilder;
+    /** Pretty-printing Gson instance for success responses. */
+    private static final Gson GSON_PRETTY = new GsonBuilder().setPrettyPrinting().create();
 
+    /** Factory used to obtain service-level and impersonated resource resolvers. */
+    @Reference
+    private transient ResourceResolverFactory resolverFactory;
+
+    /** AEM QueryBuilder service used to execute JCR queries for DAM assets. */
+    @Reference
+    private transient QueryBuilder queryBuilder;
+
+    private static final Pattern EMAIL_PATTERN = Pattern.compile("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+$");
+    /**
+     * Handles GET requests by resolving the user from the provided email,
+     * impersonating that user, and returning all accessible DAM assets as JSON.
+     *
+     * @param request  the Sling HTTP request (expects query param {@code email})
+     * @param response the Sling HTTP response (JSON output)
+     * @throws IOException if writing to the response fails
+     */
     @Override
     protected void doGet(SlingHttpServletRequest request, SlingHttpServletResponse response)
-            throws ServletException, IOException {
+           {
 
         response.setContentType("application/json");
         response.setCharacterEncoding("UTF-8");
 
         String userEmail = request.getParameter(PARAM_EMAIL);
 
-        // Validate required parameters
-        if (isBlank(userEmail)) {
-            sendError(response, SlingHttpServletResponse.SC_BAD_REQUEST,
-                    "Missing required parameters: email");
+        if (!isValidEmail(userEmail)) {
+            sendError(response, HttpServletResponse.SC_BAD_REQUEST,
+                    "Invalid or missing email parameter");
             return;
         }
 
         try (ResourceResolver serviceResolver = getServiceResolver()) {
 
-            // Get JackrabbitSession for UserManager access
-            JackrabbitSession jackrabbitSession = getJackrabbitSession(serviceResolver);
-            if (jackrabbitSession == null) {
-                sendError(response, SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR,
+            // Step 1: Look up userId by email
+            JackrabbitSession serviceSession = getJackrabbitSession(serviceResolver);
+            if (serviceSession == null) {
+                sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
                         "Could not obtain JackrabbitSession");
                 return;
             }
 
-            // Find userId by email
-            UserManager userManager = jackrabbitSession.getUserManager();
+            UserManager userManager = serviceSession.getUserManager();
             String userId = findUserIdByEmail(userManager, userEmail);
             if (userId == null) {
-                sendError(response, SlingHttpServletResponse.SC_BAD_REQUEST,
+                sendError(response, HttpServletResponse.SC_BAD_REQUEST,
                         "User not found with email: " + userEmail);
                 return;
             }
 
-            // Get user's principals (user + all groups)
-            Set<Principal> principals = getUserPrincipals(userManager, userId);
-            if (principals == null || principals.isEmpty()) {
-                sendError(response, SlingHttpServletResponse.SC_BAD_REQUEST,
-                        "Could not retrieve principals for user: " + userId);
-                return;
-            }
-
-            // Query all assets
-            SearchResult searchResult = queryContentFragments(jackrabbitSession);
-
-            // Filter by ACL and build response
-            List<Map<String, Object>> accessibleAssets = filterByPermissions(
-                    searchResult, jackrabbitSession, principals);
-
-            // Build and send response
-            sendSuccessResponse(response, accessibleAssets, searchResult);
+            // Step 2: Impersonate and query
+            queryAndRespond(serviceResolver, userId, response);
 
         } catch (LoginException e) {
             log.error("Service login failed", e);
-            sendError(response, SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR,
+            sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
                     "Service login failed");
         } catch (RepositoryException e) {
             log.error("Repository error while checking entitlements", e);
-            sendError(response, SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR,
+            sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
                     "Repository error while checking entitlements");
         }
     }
 
+    private boolean isValidEmail(String email) {
+        return email != null && !email.trim().isEmpty()
+                && EMAIL_PATTERN.matcher(email).matches();
+    }
+
     /**
-     * Gets JackrabbitSession from ResourceResolver.
+     * Impersonates the given user, queries for content fragments, and streams the JSON response.
+     *
+     * @param serviceResolver the service-level resource resolver
+     * @param userId          the user ID to impersonate
+     * @param response        the HTTP response to write to
+     * @throws IOException if writing to the response fails
+     */
+    private void queryAndRespond(ResourceResolver serviceResolver, String userId,
+                                SlingHttpServletResponse response) throws IOException {
+        try (ResourceResolver impersonatedResolver = serviceResolver.clone(
+                Collections.singletonMap(ResourceResolverFactory.USER_IMPERSONATION, userId))) {
+
+            Session impersonatedSession = impersonatedResolver.adaptTo(Session.class);
+            if (impersonatedSession == null) {
+                sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
+                        "Could not obtain session for impersonated user: " + userId);
+                return;
+            }
+
+            SearchResult searchResult = queryAssets(impersonatedSession);
+            streamSuccessResponse(response, searchResult, impersonatedResolver);
+
+        } catch (LoginException e) {
+            log.error("Failed to impersonate user '{}'. Ensure the service user has "
+                    + "jcr:impersonate privilege.", userId, e);
+            sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
+                    "Failed to impersonate user: " + userId);
+        } catch (RuntimeException e) {
+            log.error("Query failed for user '{}'.", userId, e);
+            sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
+                    "Query execution failed");
+        }
+    }
+
+    /**
+     * Streams assets directly to the response as they're processed,
+     * avoiding holding all results in memory simultaneously.
+     */
+    private void streamSuccessResponse(SlingHttpServletResponse response,
+                                       SearchResult searchResult,
+                                       ResourceResolver resolver) throws IOException {
+
+        response.setStatus(HttpServletResponse.SC_OK);
+
+        try (JsonWriter writer = new JsonWriter(response.getWriter())) {
+            writer.setIndent("  "); // Pretty print (remove for compact output)
+
+            writer.beginObject();
+            writer.name("success").value(true);
+            writer.name("total").value(searchResult.getTotalMatches());
+            writer.name("more").value(searchResult.hasMore());
+
+            // Stream hits array
+            writer.name("hits");
+            writer.beginArray();
+
+            int count = 0;
+            int errorCount = 0;
+
+            for (Hit hit : searchResult.getHits()) {
+                try {
+                    String path = hit.getPath();
+                    Resource assetResource = resolver.getResource(path);
+
+                    if (assetResource != null) {
+                        Map<String, Object> assetData = buildAssetData(assetResource, path);
+                        GSON.toJson(assetData, Map.class, writer);
+                        count++;
+                    }
+                } catch (RepositoryException e) {
+                    errorCount++;
+                    if (errorCount <= 5) {
+                        log.warn("Error processing hit: {}", e.getMessage());
+                    }
+                }
+            }
+
+            writer.endArray();
+
+            // Write count after streaming (we now know the actual count)
+            writer.name("results").value(count);
+
+            if (errorCount > 0) {
+                writer.name("errors").value(errorCount);
+            }
+
+            writer.endObject();
+        }
+    }
+    /**
+     * Adapts the given resolver's session to a {@link JackrabbitSession}.
+     *
+     * @param resolver the resource resolver to adapt
+     * @return the JackrabbitSession, or {@code null} if the session is not a Jackrabbit implementation
      */
     private JackrabbitSession getJackrabbitSession(ResourceResolver resolver) {
         Session session = resolver.adaptTo(Session.class);
@@ -150,14 +246,17 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
     }
 
     /**
-     * Finds user ID by email address.
+     * Looks up a user's JCR ID by searching the {@code profile/email} property.
+     *
+     * @param userManager the Jackrabbit user manager
+     * @param email       the email address to search for
+     * @return the user ID, or {@code null} if no matching user is found
+     * @throws RepositoryException if the user query fails
      */
-    private String findUserIdByEmail(UserManager userManager, String email) throws RepositoryException {
+    private String findUserIdByEmail(UserManager userManager, String email)
+            throws RepositoryException {
         Iterator<Authorizable> it = userManager.findAuthorizables(
-                "profile/email",
-                email,
-                UserManager.SEARCH_TYPE_USER);
-
+                "profile/email", email, UserManager.SEARCH_TYPE_USER);
         if (it.hasNext()) {
             return it.next().getID();
         }
@@ -165,124 +264,81 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
     }
 
     /**
-     * Retrieves user principal and all group principals for ACL checking.
+     * Executes a QueryBuilder search for all {@code dam:Asset} nodes under
+     * {@code /content/dam/jigsaw} using the provided session.
+     *
+     * @param session the JCR session (determines ACL-filtered results)
+     * @return the search result containing matching asset hits
      */
-    private Set<Principal> getUserPrincipals(UserManager userManager, String userId)
-            throws RepositoryException {
-
-        Authorizable authorizable = userManager.getAuthorizable(userId);
-        if (authorizable == null) {
-            return null;
-        }
-
-        Set<Principal> principals = new HashSet<>();
-        principals.add(authorizable.getPrincipal());
-
-        Iterator<Group> groups = authorizable.memberOf();
-        while (groups.hasNext()) {
-            principals.add(groups.next().getPrincipal());
-        }
-
-        return principals;
-    }
-
-    /**
-     * Queries all content fragments under the specified root path.
-     */
-    private SearchResult queryContentFragments(Session session) {
-        Map<String, String> queryMap = new HashMap<>();
-        queryMap.put("type", "dam:Asset");
-        queryMap.put("path", "/content/dam/jigsaw");
-        queryMap.put("p.limit", "-1");
-        queryMap.put("p.guessTotal", "true");
-
+    private SearchResult queryAssets(Session session) {
+            Map<String, String> queryMap = Map.of(
+                "type", "dam:Asset",
+                "path", "/content/dam/jigsaw",
+                "p.limit", "-1",
+                "p.guessTotal", "true"
+        );
         return queryBuilder.createQuery(PredicateGroup.create(queryMap), session).getResult();
     }
 
     /**
-     * Filters search results based on user's read permissions.
-     */
-    private List<Map<String, Object>> filterByPermissions(SearchResult searchResult,
-            Session session, Set<Principal> principals) throws RepositoryException {
-
-        JackrabbitAccessControlManager acm = (JackrabbitAccessControlManager) session.getAccessControlManager();
-        Privilege[] readPrivilege = new Privilege[] {
-                acm.privilegeFromName(Privilege.JCR_READ)
-        };
-
-        List<Map<String, Object>> accessibleAssets = new ArrayList<>();
-
-        for (Hit hit : searchResult.getHits()) {
-            try {
-                String path = hit.getPath();
-
-                if (acm.hasPrivileges(path, principals, readPrivilege)) {
-                    Resource assetResource = hit.getResource();
-                    if (assetResource != null) {
-                        accessibleAssets.add(buildAssetData(assetResource, path));
-                    }
-                }
-            } catch (RepositoryException e) {
-                log.warn("Error processing hit at {}: {}", hit.getPath(), e.getMessage());
-            }
-        }
-
-        return accessibleAssets;
-    }
-
-    /**
-     * Builds complete asset data map including all properties and child nodes.
+     * Builds a map representing a single asset, including its properties
+     * and the full {@code jcr:content} subtree.
+     *
+     * @param assetResource the Sling resource for the DAM asset
+     * @param path          the JCR path of the asset
+     * @return an ordered map of the asset's data suitable for JSON serialization
      */
     private Map<String, Object> buildAssetData(Resource assetResource, String path) {
         Map<String, Object> assetData = new LinkedHashMap<>();
         assetData.put("jcr:path", path);
-
         addAllProperties(assetResource, assetData);
 
         Resource jcrContent = assetResource.getChild("jcr:content");
         if (jcrContent != null) {
             assetData.put("jcr:content", buildNodeMap(jcrContent));
         }
-
         return assetData;
     }
 
     /**
-     * Adds all properties from a resource to the map.
-     * Only includes JSON-serializable values.
+     * Copies all serializable properties from a resource's {@link ValueMap} into the target map.
+     *
+     * @param resource the Sling resource whose properties are read
+     * @param map      the destination map to populate
      */
     private void addAllProperties(Resource resource, Map<String, Object> map) {
         if (resource == null) {
             return;
         }
-
         ValueMap props = resource.getValueMap();
-        for (String key : props.keySet()) {
-            Object value = props.get(key);
-            Object serializable = toSerializable(value);
+        for (Map.Entry<String, Object> entry : props.entrySet()) {
+            Object serializable = toSerializable(entry.getValue());
             if (serializable != null) {
-                map.put(key, serializable);
+                map.put(entry.getKey(), serializable);
             }
         }
     }
 
     /**
-     * Recursively builds a map of all properties and child nodes.
+     * Recursively converts a resource and all its children into a nested map structure.
+     *
+     * @param resource the root resource to traverse
+     * @return an ordered map representing the node tree
      */
     private Map<String, Object> buildNodeMap(Resource resource) {
         Map<String, Object> map = new LinkedHashMap<>();
-
         addAllProperties(resource, map);
-
         for (Resource child : resource.getChildren()) {
             map.put(child.getName(), buildNodeMap(child));
         }
-
         return map;
     }
 
     /**
-     * Formats calendar to readable date string.
+     * Formats a {@link Calendar} value into a human-readable UTC date string.
+     *
+     * @param cal the calendar instance to format
+     * @return the formatted date string, or {@code null} if {@code cal} is null
      */
     private String formatDate(Calendar cal) {
         if (cal == null) {
@@ -294,70 +350,59 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
     }
 
     /**
-     * Sends successful JSON response.
-     */
-    private void sendSuccessResponse(SlingHttpServletResponse response,
-            List<Map<String, Object>> assets, SearchResult searchResult) throws IOException {
-
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("success", true);
-        result.put("results", assets.size());
-        result.put("total", searchResult.getTotalMatches());
-        result.put("more", searchResult.hasMore());
-        result.put("offset", 0);
-        result.put("hits", assets);
-
-        response.setStatus(SlingHttpServletResponse.SC_OK);
-        response.getWriter().write(new GsonBuilder().setPrettyPrinting().create().toJson(result));
-    }
-
-    /**
-     * Sends JSON error response.
+     * Writes a JSON error response with the given HTTP status code and message.
+     *
+     * @param response the HTTP response to write to
+     * @param status   the HTTP status code (e.g. 400, 500)
+     * @param message  the error message included in the JSON body
+     * @throws IOException if writing to the response output stream fails
      */
     private void sendError(SlingHttpServletResponse response, int status, String message)
             throws IOException {
         response.setStatus(status);
-        response.getWriter().write(new Gson().toJson(Map.of("error", message)));
+        response.getWriter().write(GSON.toJson(Map.of("error", message)));
     }
 
     /**
-     * Checks if string is null or blank.
-     */
-    private boolean isBlank(String str) {
-        return str == null || str.trim().isEmpty();
-    }
-
-    /**
-     * Converts value to JSON-serializable type.
+     * Converts a JCR property value into a JSON-safe type.
+     * Handles primitives, strings, numbers, booleans, calendars, and arrays
+     * (including primitive arrays via reflection).
+     *
+     * @param value the raw JCR property value; may be {@code null}
+     * @return JSON-serializable representation, or {@code null} if unsupported
      */
     private Object toSerializable(Object value) {
         if (value == null) {
             return null;
         }
-
         if (value instanceof Calendar) {
             return formatDate((Calendar) value);
         }
-
-        if (value instanceof String || value instanceof Number ||
-                value instanceof Boolean || value instanceof String[]) {
+        if (value instanceof String || value instanceof Number || value instanceof Boolean) {
             return value;
         }
-
-        // Convert other arrays to string representation
-        if (value.getClass().isArray()) {
-            return Arrays.toString((Object[]) value);
+        if (value instanceof String[]) {
+            return value;
         }
-
+        if (value.getClass().isArray()) {
+            int length = java.lang.reflect.Array.getLength(value);
+            List<Object> list = new ArrayList<>(length);
+            for (int i = 0; i < length; i++) {
+                list.add(java.lang.reflect.Array.get(value, i));
+            }
+            return list;
+        }
         return null;
     }
 
     /**
-     * Gets service resource resolver for elevated access.
+     * Obtains a service-level {@link ResourceResolver} using the configured sub-service name.
+     *
+     * @return the service resource resolver
+     * @throws LoginException if the service user mapping is missing or login fails
      */
     private ResourceResolver getServiceResolver() throws LoginException {
-        Map<String, Object> params = new HashMap<>();
-        params.put(ResourceResolverFactory.SUBSERVICE, SUBSERVICE);
-        return resolverFactory.getServiceResourceResolver(params);
+        return resolverFactory.getServiceResourceResolver(
+                Collections.singletonMap(ResourceResolverFactory.SUBSERVICE, SUBSERVICE));
     }
 }
