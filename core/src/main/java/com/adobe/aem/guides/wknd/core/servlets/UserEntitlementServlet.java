@@ -5,7 +5,7 @@ import com.day.cq.search.QueryBuilder;
 import com.day.cq.search.result.Hit;
 import com.day.cq.search.result.SearchResult;
 import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
 
 import org.apache.jackrabbit.api.JackrabbitSession;
 import org.apache.jackrabbit.api.security.user.Authorizable;
@@ -56,6 +56,20 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
     private static final Logger log = LoggerFactory.getLogger(UserEntitlementServlet.class);
     private static final long serialVersionUID = 1L;
 
+    // ==================== Error Codes ====================
+    private static final String ERROR_INVALID_REQUEST = "INVALID_REQUEST";
+    private static final String ERROR_USER_NOT_FOUND = "USER_NOT_FOUND";
+    private static final String ERROR_USER_NOT_AUTHORIZED = "USER_NOT_AUTHORIZED";
+    private static final String ERROR_SERVICE_ERROR = "SERVICE_ERROR";
+
+    // ==================== Error Messages ====================
+    private static final String MSG_INVALID_EMAIL = "The email address is missing or not in a valid format";
+    private static final String MSG_SESSION_ERROR = "Unable to establish a secure session";
+    private static final String MSG_USER_NOT_FOUND = "No account exists with the provided email address";
+    private static final String MSG_SERVICE_UNAVAILABLE = "The entitlement service is temporarily unavailable";
+    private static final String MSG_CONTENT_RETRIEVAL_ERROR = "Unable to retrieve content information";
+    private static final String MSG_PERMISSION_ERROR = "Unable to verify user permissions";
+
     /** Service username mapped in the Sling Service User Mapper configuration. */
     private static final String SUBSERVICE = "jigsawServiceUser";
 
@@ -68,9 +82,6 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
     /** Compact Gson instance for error responses — Gson is thread-safe and reusable. */
     private static final Gson GSON = new Gson();
 
-    /** Pretty-printing Gson instance for success responses. */
-    private static final Gson GSON_PRETTY = new GsonBuilder().setPrettyPrinting().create();
-
     /** Factory used to obtain service-level and impersonated resource resolvers. */
     @Reference
     private transient ResourceResolverFactory resolverFactory;
@@ -80,6 +91,7 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
     private transient QueryBuilder queryBuilder;
 
     private static final Pattern EMAIL_PATTERN = Pattern.compile("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+$");
+
     /**
      * Handles GET requests by resolving the user from the provided email,
      * impersonating that user, and returning all accessible DAM assets as JSON.
@@ -90,7 +102,7 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
      */
     @Override
     protected void doGet(SlingHttpServletRequest request, SlingHttpServletResponse response)
-           {
+            throws IOException {
 
         response.setContentType("application/json");
         response.setCharacterEncoding("UTF-8");
@@ -99,7 +111,7 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
 
         if (!isValidEmail(userEmail)) {
             sendError(response, HttpServletResponse.SC_BAD_REQUEST,
-                    "Invalid or missing email parameter");
+                    ERROR_INVALID_REQUEST, MSG_INVALID_EMAIL);
             return;
         }
 
@@ -109,7 +121,7 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
             JackrabbitSession serviceSession = getJackrabbitSession(serviceResolver);
             if (serviceSession == null) {
                 sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-                        "Could not obtain JackrabbitSession");
+                        ERROR_SERVICE_ERROR, MSG_SESSION_ERROR);
                 return;
             }
 
@@ -117,7 +129,7 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
             String userId = findUserIdByEmail(userManager, userEmail);
             if (userId == null) {
                 sendError(response, HttpServletResponse.SC_BAD_REQUEST,
-                        "User not found with email: " + userEmail);
+                        ERROR_USER_NOT_FOUND, MSG_USER_NOT_FOUND);
                 return;
             }
 
@@ -127,11 +139,11 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
         } catch (LoginException e) {
             log.error("Service login failed", e);
             sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-                    "Service login failed");
+                    ERROR_SERVICE_ERROR, MSG_SERVICE_UNAVAILABLE);
         } catch (RepositoryException e) {
             log.error("Repository error while checking entitlements", e);
             sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-                    "Repository error while checking entitlements");
+                    ERROR_SERVICE_ERROR, MSG_CONTENT_RETRIEVAL_ERROR);
         }
     }
 
@@ -156,7 +168,7 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
             Session impersonatedSession = impersonatedResolver.adaptTo(Session.class);
             if (impersonatedSession == null) {
                 sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-                        "Could not obtain session for impersonated user: " + userId);
+                        ERROR_SERVICE_ERROR, MSG_PERMISSION_ERROR);
                 return;
             }
 
@@ -167,11 +179,11 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
             log.error("Failed to impersonate user '{}'. Ensure the service user has "
                     + "jcr:impersonate privilege.", userId, e);
             sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-                    "Failed to impersonate user: " + userId);
+                    ERROR_SERVICE_ERROR, MSG_PERMISSION_ERROR);
         } catch (RuntimeException e) {
             log.error("Query failed for user '{}'.", userId, e);
             sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-                    "Query execution failed");
+                    ERROR_SERVICE_ERROR, MSG_CONTENT_RETRIEVAL_ERROR);
         }
     }
 
@@ -230,6 +242,7 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
             writer.endObject();
         }
     }
+
     /**
      * Adapts the given resolver's session to a {@link JackrabbitSession}.
      *
@@ -350,17 +363,21 @@ public class UserEntitlementServlet extends SlingSafeMethodsServlet {
     }
 
     /**
-     * Writes a JSON error response with the given HTTP status code and message.
+     * Writes a JSON error response with the given HTTP status code, error code, and message.
      *
-     * @param response the HTTP response to write to
-     * @param status   the HTTP status code (e.g. 400, 500)
-     * @param message  the error message included in the JSON body
+     * @param response  the HTTP response to write to
+     * @param status    the HTTP status code (e.g. 400, 403, 500)
+     * @param errorCode the application-specific error code (e.g. INVALID_REQUEST)
+     * @param message   the error message included in the JSON body
      * @throws IOException if writing to the response output stream fails
      */
-    private void sendError(SlingHttpServletResponse response, int status, String message)
-            throws IOException {
+    private void sendError(SlingHttpServletResponse response, int status, 
+                          String errorCode, String message) throws IOException {
         response.setStatus(status);
-        response.getWriter().write(GSON.toJson(Map.of("error", message)));
+        JsonObject json = new JsonObject();
+        json.addProperty("error", message);
+        json.addProperty("errorCode", errorCode);
+        response.getWriter().write(json.toString());
     }
 
     /**
