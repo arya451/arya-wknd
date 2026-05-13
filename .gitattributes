@@ -1,0 +1,4 @@
+# Force LF line endings for AEM Dispatcher config files so MD5 checksums
+# in dispatcher/pom.xml remain valid on Windows (core.autocrlf=true) and Linux alike.
+dispatcher/src/conf.d/**            text eol=lf
+dispatcher/src/conf.dispatcher.d/** text eol=lf
